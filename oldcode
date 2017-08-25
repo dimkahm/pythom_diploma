@@ -1,0 +1,301 @@
+# -*- coding: utf-8 -*-
+import os
+import re
+import hashlib
+import subprocess
+from importlib import import_module
+from urllib2.request import quote, urlopen, HTTPError, URLError, urlparse
+
+import chardet
+from html2text import html2text
+from django.core.management.base import BaseCommand, CommandError
+from django.utils import timezone
+from django.db.models import Q
+from django.db import connection
+
+from search.models import Task, TaskLog, Wordidf, Name, Word, StopWord, Link, Data, List
+from search.models import TASK_START_TYPE_DAILY, TASK_START_TYPE_WEEKLY, TASK_START_TYPE_MONTHLY, \
+    COMPILATION_METHOD_OR, TASK_STATUS_ERROR, TASK_STATUS_DONE, TASK_STATUS_NEW, TASK_STATUS_START, \
+    TASK_STATUS_REJECTED, CHECKED_UNAPPROVED, LIST_WHITE, TASK_STATUS_ENCODING, LIST_BLACK, LIST_BLOCKED, \
+    CHECKED_APPROVED, CHECKED_BLOCKED
+
+
+class Command(BaseCommand):
+    help = "Perform 'worker' operations."
+    pidfile = "C:/dev/temp/rock_worker.pid" if os.name == 'nt' else "/tmp/rock_worker.pid"
+    debug = False
+
+    def handle(self, *args, **options):
+        self.debug = True if int(options["verbosity"]) >= 2 else False
+
+        # только качаем данные
+        if options["download"]:
+            self.pidfile = "C:/dev/temp/rock_download.pid" if os.name == 'nt' else "/tmp/rock_download.pid"
+            self.startup()
+            self.links()
+            self.shutdown()
+
+        # только запускаем процедуры БД
+        if options["database"]:
+            self.pidfile = "C:/dev/temp/rock_database.pid" if os.name == 'nt' else "/tmp/rock_database.pid"
+            self.startup()
+            self.run_db_procedures()
+            self.shutdown()
+
+        # по умолчанию только выполняем задания
+        self.startup()
+        self.tasks()
+        self.shutdown()
+ No module named request
+    def startup(self):
+        pid = str(os.getpid())
+
+        if os.path.isfile(self.pidfile):
+            raise CommandError("{0} already exists, exiting".format(self.pidfile))
+        else:
+            open(self.pidfile, 'w').write(pid)
+
+    def shutdown(self):
+        os.unlink(self.pidfile)
+        exit()
+
+    def add_arguments(self, parser):
+        parser.add_argument("--download", default=False, action='store_true', help="Only download data links")
+        parser.add_argument("--database", default=False, action='store_true', help="Only Database routine")
+
+    @staticmethod
+    def run_db_procedures():
+        cursor = connection.cursor()
+        cursor.execute("SELECT bridge.tfidf_wrd();")
+        cursor.execute("UPDATE bridge.data SET possibility = bridge.rel(id) WHERE possibility IS NULL")
+        cursor.execute("SELECT bridge.upd_knowledge_base();")
+        cursor.execute("SELECT bridge.upd_words_index();")
+        cursor.execute("SELECT bridge.voc_chart();")
+
+    def tasks(self):
+        """Обработка заданий для локальных драйверов"""
+
+        tasks = Task.objects.filter(start__lte=timezone.now()).filter(
+            Q(end__gte=timezone.now()) | Q(end__isnull=True)).order_by("start")
+        tasks_queue = []
+
+        for task in tasks:
+
+            # первый запуск любого задания
+            if task.first_run:
+                tasks_queue.append(task)
+                continue
+
+            # запуск ежедневных заданий
+            if task.start_type == TASK_START_TYPE_DAILY:
+                log = TaskLog.objects.filter(task=task).order_by("-end").first()
+
+                if log and log.end and (timezone.now() - log.end).days >= 1:
+                    tasks_queue.append(task)
+
+                continue
+
+            # запуск еженедельных заданий
+            if task.start_type == TASK_START_TYPE_WEEKLY:
+                log = TaskLog.objects.filter(task=task).order_by("-end").first()
+
+                if log and log.end and (timezone.now() - log.end).days >= 7:
+                    tasks_queue.append(task)
+
+                continue
+
+            # запуск ежемесячных заданий
+            if task.start_type == TASK_START_TYPE_MONTHLY:
+                log = TaskLog.objects.filter(task=task).order_by("-end").first()
+
+                if log and log.end and (timezone.now() - log.end).days >= 7:
+                    tasks_queue.append(task)
+
+                continue
+
+        if self.debug:
+            self.stdout.write("Tasks queue: {} tasks".format(len(tasks_queue)))
+
+        for task in tasks_queue:
+            log = TaskLog.objects.create(task=task)
+
+            search = list()
+
+            if task.use_top:
+                search = Wordidf.words_for_request(v=task.top_num, a=task.top_length, z=task.top_request_length)
+            else:
+                names = Name.objects.filter(group__category=task.category)
+
+            for name in names:
+                syns = Word.objects.filter(name=name)
+                stops = StopWord.objects.filter(name=name)
+                phrase = ""
+
+                if task.driver_type.name == "google" and task.driver_type.compilation == COMPILATION_METHOD_OR:
+                    phrase = ' OR '.join((s.word for s in syns))
+                else:
+                    phrase = ' '.join((s.word for s in syns))
+
+                if len(stops) > 0:
+                    phrase += ' ' + ' '.join(("-{0}".format(stop.word) for stop in stops))
+
+                if len(phrase) > 0:
+                    search.append(phrase)
+
+                for query in name.query_set.all():
+                    search.append(query.query)
+
+                if len(search) == 0:
+                    continue
+
+            if self.debug:
+                self.stdout.write("Search data ({} items):".format(len(search)))
+
+            driver_string = "search.drivers." + task.driver_type.name.lower().replace(" ", "")
+            try:
+                driver = import_module(driver_string)
+            except ImportError as e:
+                if self.debug:
+                    self.stderr.write("Can't load driver: %s" % (str(e),))
+                log.status = TASK_STATUS_ERROR
+                log.end = timezone.now()
+                log.save()
+                continue
+
+            for s in search:
+                process = subprocess.Popen([task.driver_type.executable, quote(s)], stdout=subprocess.PIPE)
+                output = process.communicate()[0]
+
+                if output:
+                    try:
+                        driver_object = driver.Driver(task=task, term=s)
+                        driver_object.process(output)
+                    except Exception as e:
+                        if self.debug:
+                            self.stderr.write("Driver error: " + str(e))
+                        log.status = TASK_STATUS_ERROR
+                        log.end = timezone.now()
+                        log.save()
+                        continue
+
+                    log.status = TASK_STATUS_DONE
+                    log.end = timezone.now()
+                    log.save()
+
+                    if task.first_run:
+                        task.first_run = False
+                        task.save()
+
+            if len(search) == 0:
+                log.status = TASK_STATUS_DONE
+                log.end = timezone.now()
+                log.save()
+
+    def links(self):
+        """Получение данных из интернетов по ссылкам"""
+
+        while Link.objects.filter(status=TASK_STATUS_NEW).count() > 0:
+            link = Link.objects.filter(status=TASK_STATUS_NEW).order_by("created").first()
+            link.status = TASK_STATUS_START
+            link.save()
+            text = None
+
+            try:
+                document = urlopen(link.url, timeout=20)
+                text = document.read()
+                doc_info = chardet.detect(text)
+                text = text.decode(doc_info["encoding"]) if doc_info["encoding"] else text.decode()
+                document.close()
+            except (URLError, HTTPError):
+                link.status = TASK_STATUS_ERROR
+                link.done = timezone.now()
+                link.save()
+                continue
+            except (UnicodeDecodeError, UnicodeError):
+                link.status = TASK_STATUS_ENCODING
+                link.done = timezone.now()
+                link.save()
+                continue
+            except Exception as e:
+                if self.debug:
+                    self.stderr.write("Links error: {}".format(str(e)))
+                link.status = TASK_STATUS_ERROR
+                link.done = timezone.now()
+                link.save()
+                continue
+
+            try:
+                if text and document.getcode() == 200:
+                    old_data = Data.objects.filter(link__url=link.url).order_by("-version")
+
+                    new_hash = hashlib.md5()
+                    new_hash.update(text.encode("utf-8"))
+
+                    if len(old_data) > 0 and new_hash.hexdigest() == old_data[0].hash:
+                        old_data[0].updated = timezone.now()
+                        old_data[0].save()
+                        link.status = TASK_STATUS_REJECTED
+                        link.done = timezone.now()
+                        link.save()
+                        continue
+
+                    article = Data()
+                    article.title = link.title
+                    article.html = text
+                    article.text = html2text(text)
+                    article.hash = new_hash.hexdigest()
+                    article.link = link
+
+                    if len(old_data) > 0 and new_hash.hexdigest() != old_data[0].hash:
+                        article.parent = old_data[0].parent if old_data[0].parent else old_data[0]
+                        article.version = old_data[0].version + 1
+
+                    article.save()
+
+                    if not self.debug:
+                        cursor = connection.cursor()
+                        cursor.execute(u'''
+                            UPDATE data SET
+                            html = ts_headline(html, '{0}',
+                            'StartSel=''<span style="color:white;background-color:red">'', StopSel=</span>, HighlightAll=TRUE')
+                            WHERE id = {1}'''.format(
+                            ' '.join(re.sub(r'[^\w]', ' ', link.search_request).split()).replace(' ', ' | '),
+                            article.id))
+
+                    link.status = TASK_STATUS_DONE
+                    link.done = timezone.now()
+
+                    uri = urlparse(link.url)
+                    domain = uri.netloc
+                    white_list = False
+                    blocked_list = False
+
+                    for w in List.objects.filter(list=LIST_WHITE, category=link.task.category):
+                        if w.name in domain:
+                            article.verified = CHECKED_UNAPPROVED
+                            white_list = True
+                            break
+                    if not white_list:
+                        for b in List.objects.filter(list=LIST_BLOCKED, category=link.task.category):
+                            if b.name in domain:
+                                article.verified = CHECKED_BLOCKED
+                                blocked_list = True
+                                break
+                    if not white_list and not blocked_list:
+                        for bl in List.objects.filter(list=LIST_BLACK, category=link.task.category):
+                            if bl.name in domain:
+                                article.verified = CHECKED_APPROVED
+                                break
+                    article.save()
+                else:
+                    link.status = TASK_STATUS_ERROR
+                    link.done = timezone.now()
+
+                link.save()
+            except Exception as e:
+                if self.debug:
+                    self.stderr.write("Document error: {}".format(str(e)))
+                link.status = TASK_STATUS_ERROR
+                link.done = timezone.now()
+                link.save()
+                continue

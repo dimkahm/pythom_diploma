@@ -1,0 +1,23 @@
+# -*- coding: utf-8 -*-
+import psycopg2
+import re
+import urllib
+import feedparser
+import html2text
+import chardet
+
+
+regexp = r"<item>.+</link>\s+<title>([А-Яа-я]\s*#\d*)</title>.+</pubDate>\s+<description><!\[CDATA\[(.+)\]\]>\s*</description>\s+</item>"
+f = open('/home/dimka/Desktop/feedparse/feedparse.csv','w')
+def take_rss(a):
+	rss_text = urllib.urlopen(a).read()
+	f.write(rss_text)
+	f.close()
+	f1 = open('/home/dimka/Desktop/feedparse/feedparse.csv','r')
+	rss_text = f1.read()
+	rss = re.findall(regexp,rss_text)
+	print rss
+
+
+feed = "http://news.yandex.ru/index.rss"#raw_input("Введите ссылку на фид.\n")#http://bash.org.ru/rss/
+
